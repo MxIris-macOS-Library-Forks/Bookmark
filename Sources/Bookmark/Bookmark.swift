@@ -1,7 +1,7 @@
 //
 //  Bookmark.swift
 //
-//  Copyright © 2022 Darren Ford. All rights reserved.
+//  Copyright © 2024 Darren Ford. All rights reserved.
 //
 //  MIT license
 //
@@ -20,7 +20,6 @@
 //
 
 import Foundation
-import UniformTypeIdentifiers
 
 /// A bookmark object that describes the location of a file.
 ///
@@ -34,19 +33,25 @@ import UniformTypeIdentifiers
 /// [Enabling Security-Scoped Bookmark and URL Access](https://developer.apple.com/documentation/professional_video_applications/fcpxml_reference/asset/media-rep/bookmark/enabling_security-scoped_bookmark_and_url_access)
 ///
 /// [Bookmarks and Security Scope](https://developer.apple.com/documentation/foundation/nsurl#1663783)
-@available(macOS 10.12, iOS 14, tvOS 14, *)
-public class Bookmark: CustomStringConvertible, Codable {
+public class Bookmark: Codable {
 	enum CodingKeys: CodingKey {
 		case bookmarkData
 	}
 
 	/// Bookmark-specific errors
 	public enum BookmarkError: Error {
+		/// The URL specified was not a valid file URL
 		case invalidFileURL
+		/// Couldn't retrieve type identifier for the bookmark's target URL
 		case cantAccessTargetUTType
+		/// The target for the bookmark doesn't have a valid UTI
 		case invalidTargetUTType
+		/// Bookmark was created with security scoping
 		case cantAccessSecurityScopedResource
+		/// Attemped to resolve the bookmark (and was successful), but the bookmark needs to be rebuilt as it is stale
 		case bookmarkIsStaleNeedsRebuild
+		/// Attempt to resolve the bookmark, but it is invalid
+		case bookmarkIsInvalid
 	}
 
 	/// The bookmark's state.
@@ -59,13 +64,38 @@ public class Bookmark: CustomStringConvertible, Codable {
 		case invalid
 	}
 
-	/// The result of retrieving a URL from a bookmark
-	public struct TargetURL {
+	/// [macOS only] The security scoping to apply to the bookmark.
+	///
+	/// A convenience for applying security options to a bookmark
+	public enum SecurityScopeOptions {
+		/// Apply no security scoping to the bookmark
+		case none
+		/// Create a security-scoped bookmark that, when resolved, provides a security-scoped URL allowing read-only
+		/// access to a file-system resource.
+		case securityScopingReadOnly
+		/// Specifies that you want to create a security-scoped bookmark that, when resolved, provides a security-scoped
+		/// URL allowing read/write access to a file-system resource.
+		case securityScopingReadWrite
+	}
+
+	/// The bookmark's security scoping
+	public enum SecurityScope {
+		/// Bookmark has no security scoping
+		case notSecurityScoped
+		/// Bookmark is security scoped
+		case securityScoped
+		/// Bookmark is invalid
+		case invalid
+	}
+
+	/// A snapshot of a bookmark's state and target url
+	public struct Resolved {
 		/// The state of the bookmark
 		public let state: Bookmark.State
 		/// The target URL for the bookmark
 		public let url: URL
-		public init(result: Bookmark.State, url: URL) {
+		/// Create a TargetURL object
+		internal init(result: Bookmark.State, url: URL) {
 			self.state = result
 			self.url = url
 		}
@@ -82,45 +112,60 @@ public class Bookmark: CustomStringConvertible, Codable {
 	///
 	/// If the URL is no longer valid (eg the target file can no longer be found, returns .invalid)
 	public var state: State {
-		guard let state = try? targetURL().state else {
-			return .invalid
-		}
-		return state
+		(try? self.resolved().state) ?? .invalid
 	}
 
 	/// Returns true if the bookmark was created with security scope (creation options contained `.withSecurityScope`)
-	/// and the target for the bookmark is still resolvable. Returns `nil` if the bookmark is no longer resolvable.
+	/// and the target for the bookmark is still resolvable.
 	///
-	/// Note: iOS bookmarks are ALWAYS security scoped.
-	public var isSecurityScoped: Bool? {
-		guard self.state == .invalid else {
-			return nil
+	/// Returns `.invalid` if the bookmark is no longer resolvable.
+	///
+	/// Note: iOS, tvOS, watchOS bookmarks are ALWAYS security scoped if they are valid.
+	public var isSecurityScoped: SecurityScope {
+		guard self.state != .invalid else {
+			return SecurityScope.invalid
 		}
 
-#if os(macOS)
+		#if os(macOS)
 		guard
-			let result = try? targetURL(options: .withSecurityScope),
+			let result = try? self.resolved(options: .withSecurityScope),
 			result.state != .invalid
 		else {
-			return false
+			return SecurityScope.notSecurityScoped
 		}
-#endif
-		return true
+		#endif
+		
+		return SecurityScope.securityScoped
 	}
 
 	/// Create a bookmark object from a target file url
 	/// - Parameters:
 	///   - targetFileURL: The target file url to bookmark
+	///   - security: The security scoping to apply to the bookmark access (ignored for non-macOS platforms)
 	///   - includingResourceValuesForKeys: Resource keys to store in the bookmark
 	///   - options: Bookmark creation options
 	public init(
 		targetFileURL: URL,
+		security: SecurityScopeOptions = .none,
 		includingResourceValuesForKeys keys: Set<URLResourceKey>? = nil,
 		options: URL.BookmarkCreationOptions = []
 	) throws {
 		guard targetFileURL.isFileURL else {
 			throw BookmarkError.invalidFileURL
 		}
+
+		#if os(macOS)
+		var options = options
+		switch security {
+		case .none:
+			break
+		case .securityScopingReadOnly:
+			options.insert(.withSecurityScope)
+			options.insert(.securityScopeAllowOnlyReadAccess)
+		case .securityScopingReadWrite:
+			options.insert(.withSecurityScope)
+		}
+		#endif
 
 		self.bookmarkData = try targetFileURL.bookmarkData(
 			options: options,
@@ -132,15 +177,18 @@ public class Bookmark: CustomStringConvertible, Codable {
 	/// Create a bookmark object from a target file path
 	/// - Parameters:
 	///   - targetFilePath: The target file path to bookmark
+	///   - security: The security scoping to apply to the bookmark access (ignored for non-macOS platforms)
 	///   - includingResourceValuesForKeys: Resource keys to store in the bookmark
 	///   - options: Bookmark creation options
 	@inlinable public convenience init(
 		targetFilePath: String,
+		security: SecurityScopeOptions = .none,
 		includingResourceValuesForKeys keys: Set<URLResourceKey>? = nil,
 		options: URL.BookmarkCreationOptions = []
 	) throws {
 		try self.init(
 			targetFileURL: URL(fileURLWithPath: targetFilePath),
+			security: security,
 			includingResourceValuesForKeys: keys,
 			options: options
 		)
@@ -178,12 +226,12 @@ public class Bookmark: CustomStringConvertible, Codable {
 public extension Bookmark {
 	/// A textual representation of this instance.
 	var description: String {
-#if os(macOS)
-		if let url = try? targetURL(options: .withSecurityScope) {
+		#if os(macOS)
+		if let url = try? resolved(options: .withSecurityScope) {
 			return "Bookmark(🔒): '\(url)'"
 		}
-#endif
-		if let url = try? self.targetURL() {
+		#endif
+		if let url = try? self.resolved() {
 			return "Bookmark: '\(url)'"
 		}
 		return "<invalid bookmark>"
@@ -193,16 +241,18 @@ public extension Bookmark {
 // MARK: - Accessing the bookmark's target
 
 public extension Bookmark {
-	/// Returns the bookmark's target url
+	/// Resolve the bookmark and return the state and target URL.
 	/// - Parameters:
 	///   - options: Additional bookmark resolution options (See: [Bookmark Resolution Options](https://developer.apple.com/documentation/foundation/nsurl/bookmarkresolutionoptions)
 	/// - Returns: A `TargetURL` object consisting of the bookmark's state and the target url
-	@inlinable func targetURL(
+	///
+	/// If the bookmark is created with the `securityScoped` option,
+	func resolved(
 		options: NSURL.BookmarkResolutionOptions = []
-	) throws -> TargetURL {
+	) throws -> Resolved {
 		var isStale = false
 		let url = try URL(resolvingBookmarkData: self.bookmarkData, options: options, bookmarkDataIsStale: &isStale)
-		return TargetURL(result: isStale ? .stale : .valid, url: url)
+		return Resolved(result: isStale ? .stale : .valid, url: url)
 	}
 
 	/// Access the bookmark's target url in a block scope
@@ -211,49 +261,32 @@ public extension Bookmark {
 	///   - scopedBlock: The block to perform.
 	///                  If securityScoped is true, the url will automatically be wrapped in
 	///                  `startAccessingSecurityScopedResource` and `stopAccessingSecurityScopedResource`
-	/// - Returns: A tuple consisting of the bookmark's state and the `scopedBlock`'s return value
-	func usingTargetURL<ReturnType>(
+	/// - Returns: `scopedBlock`'s return value
+	func resolving<ReturnType>(
 		options: NSURL.BookmarkResolutionOptions = [],
-		_ scopedBlock: (URL) -> ReturnType
-	) throws -> (bookmarkState: Bookmark.State, result: ReturnType) {
-		let urlResult = try targetURL(options: options)
-#if os(macOS)
+		_ scopedBlock: (Resolved) -> ReturnType
+	) throws -> ReturnType {
+		let resolvedBookmark = try self.resolved(options: options)
+		if resolvedBookmark.state == .invalid {
+			// If the bookmark is invalid, throw
+			throw BookmarkError.bookmarkIsInvalid
+		}
+		#if os(macOS)
 		let securityScoped = options.contains(.withSecurityScope)
-#else
+		#else
 		let securityScoped = true
-#endif
+		#endif
 		if securityScoped {
-			guard urlResult.url.startAccessingSecurityScopedResource() == true else {
+			guard resolvedBookmark.url.startAccessingSecurityScopedResource() == true else {
 				throw BookmarkError.cantAccessSecurityScopedResource
 			}
 		}
-		defer { if securityScoped { urlResult.url.stopAccessingSecurityScopedResource() } }
-		return (urlResult.state, scopedBlock(urlResult.url))
-	}
-}
-
-// MARK: - UTI/UTType
-
-public extension Bookmark {
-	/// Returns the UTI for the bookmark's target
-	func utiStringForTargetURL() throws -> String {
-		let targetURL = try self.targetURL().url
-		guard
-			let typeString = try targetURL.resourceValues(forKeys: [.typeIdentifierKey]).typeIdentifier
-		else {
-			throw BookmarkError.cantAccessTargetUTType
+		defer {
+			if securityScoped {
+				resolvedBookmark.url.stopAccessingSecurityScopedResource()
+			}
 		}
-		return typeString
-	}
-
-	/// Returns the UTI for the bookmark's target
-	@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)
-	func utiForTargetURL() throws -> UTType {
-		let utiString = try utiStringForTargetURL()
-		guard let t = UTType(utiString) else {
-			throw BookmarkError.invalidTargetUTType
-		}
-		return t
+		return scopedBlock(resolvedBookmark)
 	}
 }
 
@@ -286,7 +319,7 @@ public extension Bookmark {
 	) throws {
 		assert(fileURL.isFileURL)
 
-		let targetURL = try self.targetURL()
+		let targetURL = try self.resolved()
 
 		if targetURL.state == .stale {
 			throw BookmarkError.bookmarkIsStaleNeedsRebuild
@@ -308,7 +341,7 @@ public extension Bookmark {
 		assert(aliasFileUrl.isFileURL)
 
 		// Grab out the url for the bookmark
-		let targetURL = try self.targetURL()
+		let targetURL = try self.resolved()
 
 		if targetURL.state == .stale {
 			throw BookmarkError.bookmarkIsStaleNeedsRebuild
@@ -345,7 +378,7 @@ public extension Bookmark {
 		includingResourceValuesForKeys keys: Set<URLResourceKey>? = nil,
 		options: URL.BookmarkCreationOptions = []
 	) throws -> Bookmark {
-		let url = try self.targetURL().url
+		let url = try self.resolved().url
 		return try Bookmark(targetFileURL: url, includingResourceValuesForKeys: keys, options: options)
 	}
 }
